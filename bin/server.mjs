@@ -1414,9 +1414,16 @@ const server = http.createServer(async (req, res) => {
     if (record.challenge && !safeEqual(expected, record.challenge)) return send(res, 400, { error: "invalid_grant" });
     codes.delete(codeValue);
     const accessToken = opaque(32);
-    tokens.set(accessToken, { expiresAt: Date.now() + 60 * 60_000 });
+    // No refresh_token grant is implemented, so the original 1-hour TTL
+    // meant any MCP connector session open longer than an hour silently
+    // lost tool access with no visible reauth prompt in some clients --
+    // fine for one continuously-driven session, not for a long-running or
+    // separate per-line review conversation. Matches the existing 30-day
+    // precedent already used for the owner_inbox cookie in this file.
+    const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+    tokens.set(accessToken, { expiresAt: Date.now() + TOKEN_TTL_MS });
     await persistOAuthState();
-    send(res, 200, { access_token: accessToken, token_type: "Bearer", expires_in: 3600, scope: "draft:create" });
+    send(res, 200, { access_token: accessToken, token_type: "Bearer", expires_in: TOKEN_TTL_MS / 1000, scope: "draft:create" });
     return;
   }
 
