@@ -224,9 +224,20 @@ function tmuxSshReadReport(line) {
   });
 }
 
-function tmuxSessionExists(line) {
+// Aboardable's Working/Ready distinction comes from a real heartbeat its
+// worker pushes. ChairFly has no such push mechanism -- has-session alone
+// (session exists = "Ready") can't tell an idle prompt from mid-turn work,
+// which is exactly what looked wrong: a session with a running background
+// dev server and Claude paused waiting on it read as "Ready" either way.
+// Best-effort fix: read the pane content itself. Claude Code's own status
+// line shows "esc to interrupt" while actively generating, and "N shell"/
+// "shell still running" while it's tracking a background process it
+// started -- both are real activity, not idle. This is scraping CLI
+// chrome, not a stable API, so treat it as heuristic: it degrades to
+// "Ready" (not a false "Working") if the UI text ever changes.
+function tmuxPaneStatus(line) {
   return new Promise((resolve) => {
-    if (!line.dispatch_tmux_session) return resolve(false);
+    if (!line.dispatch_tmux_session) return resolve({ exists: false, working: false });
     const child = spawn("/usr/bin/ssh", [
       "-T",
       "-o", "BatchMode=yes",
@@ -234,11 +245,24 @@ function tmuxSessionExists(line) {
       "-o", "ConnectTimeout=5",
       ...sshPortArgs(line),
       sshTarget(line),
-      `tmux has-session -t ${shq(line.dispatch_tmux_session)} 2>/dev/null`,
-    ], { stdio: ["ignore", "ignore", "ignore"] });
-    const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(false); }, 8_000);
-    child.on("error", () => { clearTimeout(timer); resolve(false); });
-    child.on("close", code => { clearTimeout(timer); resolve(code === 0); });
+      `tmux capture-pane -t ${shq(line.dispatch_tmux_session)} -p 2>/dev/null`,
+    ], { stdio: ["ignore", "pipe", "ignore"] });
+    const chunks = [];
+    let size = 0;
+    const timer = setTimeout(() => { child.kill("SIGKILL"); resolve({ exists: false, working: false }); }, 8_000);
+    child.stdout.on("data", chunk => {
+      size += chunk.length;
+      if (size <= 64 * 1024) chunks.push(chunk);
+      else child.kill("SIGKILL");
+    });
+    child.on("error", () => { clearTimeout(timer); resolve({ exists: false, working: false }); });
+    child.on("close", code => {
+      clearTimeout(timer);
+      if (code !== 0) return resolve({ exists: false, working: false });
+      const tail = Buffer.concat(chunks).toString("utf8").split("\n").slice(-15).join("\n");
+      const working = /esc to interrupt/i.test(tail) || /\b\d+\s+shells?\b/i.test(tail) || /shells?\s+still\s+running/i.test(tail);
+      resolve({ exists: true, working });
+    });
   });
 }
 
@@ -292,8 +316,9 @@ async function getWorkerStatus(line) {
 
   if (line.dispatch_mode === "tmux-ssh") {
     let worker = { state: "unavailable", process: null, terminal_attached: false, last_heartbeat_at: null };
-    if (await tmuxSessionExists(line)) {
-      worker = { state: "ready", process: line.dispatch_tmux_session, terminal_attached: true, last_heartbeat_at: observedAt };
+    const pane = await tmuxPaneStatus(line);
+    if (pane.exists) {
+      worker = { state: pane.working ? "working" : "ready", process: line.dispatch_tmux_session, terminal_attached: true, last_heartbeat_at: observedAt };
     }
     return {
       worker,
