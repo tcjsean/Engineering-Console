@@ -10,3 +10,8 @@ node_modules/
 .ssh/
 .codex/
 *.pre-branch-report-fix
+
+# service account runtime state and secrets (not source)
+.aboardable-tools/
+.ssh
+*.bak-part3-*
