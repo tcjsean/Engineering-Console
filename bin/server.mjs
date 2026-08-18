@@ -1,6 +1,6 @@
 import http from "node:http";
 import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
-import { appendFile, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
@@ -42,7 +42,35 @@ const tokens = new Map();
 const approvalFailures = new Map();
 let loginFailures = { attempts: 0, blockedUntil: 0 };
 
+// Unlike tokens (which carry their own expiresAt and were already pruned
+// here), dynamically-registered OAuth clients never expired -- every
+// reconnect from every app instance added one permanently, both on disk
+// and in the live Map, with no cap. Confirmed growing during this same
+// session's testing (64 -> 70+ clients in under an hour). Clients have no
+// expiry of their own, so prune by registration age instead; a bit past
+// the 30-day token TTL so a client that registered but hasn't gotten a
+// token yet isn't dropped mid-flow.
+const CLIENT_RETENTION_MS = 35 * 24 * 60 * 60 * 1000;
+function pruneStaleClients() {
+  const cutoff = Date.now() - CLIENT_RETENTION_MS;
+  for (const [key, value] of clients) if ((value.createdAt || 0) < cutoff) clients.delete(key);
+}
+
+// Neither of this file's two append-only audit logs (mcp-call-audit.log,
+// send-audit.jsonl) had any size cap -- fine at current volume, but a
+// design gap that only gets worse as usage grows. Rotate to a single .1
+// generation past 5MB, same size-based approach the shell watchers use.
+const AUDIT_LOG_MAX_BYTES = 5 * 1024 * 1024;
+async function appendWithRotation(filePath, line) {
+  try {
+    const info = await stat(filePath);
+    if (info.size >= AUDIT_LOG_MAX_BYTES) await rename(filePath, `${filePath}.1`);
+  } catch {}
+  await appendFile(filePath, line, { mode: 0o600 });
+}
+
 async function persistOAuthState() {
+  pruneStaleClients();
   const state = {
     clients: [...clients.entries()],
     tokens: [...tokens.entries()].filter(([, value]) => value.expiresAt > Date.now()),
@@ -55,6 +83,7 @@ async function loadOAuthState() {
     const state = JSON.parse(await readFile(OAUTH_STATE_PATH, "utf8"));
     for (const [key, value] of state.clients || []) clients.set(key, value);
     for (const [key, value] of state.tokens || []) if (value.expiresAt > Date.now()) tokens.set(key, value);
+    pruneStaleClients();
   } catch (err) {
     if (err?.code !== "ENOENT") throw err;
   }
@@ -1415,7 +1444,7 @@ const server = http.createServer(async (req, res) => {
     if (line.status !== "active") {
       return sendHtml(res, 409, `<h1>Cannot send</h1><p>Production line "${escapeHtml(line.display_name || line.line_id)}" is not active (status: ${escapeHtml(line.status)}).</p>`);
     }
-    await appendFile(SEND_AUDIT_PATH, JSON.stringify({ at: new Date().toISOString(), draft_id: draftId, line_id: line.line_id, route: "owner-approval", remote: req.socket.remoteAddress || "", user_agent: String(req.headers["user-agent"] || "").slice(0, 240), via_inbox_session: hasOwnerInboxAuthorization(req, form) }) + "\n", { mode: 0o600 });
+    await appendWithRotation(SEND_AUDIT_PATH, JSON.stringify({ at: new Date().toISOString(), draft_id: draftId, line_id: line.line_id, route: "owner-approval", remote: req.socket.remoteAddress || "", user_agent: String(req.headers["user-agent"] || "").slice(0, 240), via_inbox_session: hasOwnerInboxAuthorization(req, form) }) + "\n");
 
     // Deliver only the owner-reviewed instruction. Claude Code treats formal
     // bridge metadata as an unfamiliar authority claim and correctly pauses;
@@ -1577,10 +1606,9 @@ const server = http.createServer(async (req, res) => {
     const response = await handleRpc(body);
     if (body?.method === "tools/call") {
       const isErr = Boolean(response?.result?.isError);
-      appendFile(
+      appendWithRotation(
         MCP_CALL_AUDIT_PATH,
         `${new Date().toISOString()} tool=${body?.params?.name || ""} line_id=${body?.params?.arguments?.line_id || ""} error=${isErr}\n`,
-        { mode: 0o600 },
       ).catch(() => {});
     }
     if (response === null) {
