@@ -505,6 +505,28 @@ async function handleRpc(rpc) {
   if (method === "ping") return result(id, {});
 
   if (method === "tools/list") {
+    // A hardcoded example in the description (e.g. "aboardable-product,
+    // chairfly-product") biases an uncertain caller toward whichever line
+    // is named first -- observed in practice: a ChairFly-side session
+    // repeatedly called with line_id=aboardable-product. An enum built
+    // from the live, active lines registry is a structural constraint,
+    // not just a hint, and it can't go stale the way a hardcoded example
+    // would as lines are added or retired.
+    let activeLineIds = [];
+    let lineListText = "the active production line";
+    try {
+      const { lines } = await consoleApiFetch("/v1/lines");
+      const active = (lines || []).filter(l => l.status === "active");
+      activeLineIds = active.map(l => l.line_id);
+      if (activeLineIds.length) {
+        lineListText = active.map(l => `${l.line_id} (${l.display_name})`).join(", ");
+      }
+    } catch {}
+    const lineIdSchema = {
+      type: "string",
+      description: `Target production line id. Currently active: ${lineListText}. Required -- never guess or default to one; if you do not know which line this conversation is for, ask the user before calling.`,
+      ...(activeLineIds.length ? { enum: activeLineIds } : {}),
+    };
     return result(id, {
       tools: [{
         name: "create_worker_draft",
@@ -513,7 +535,7 @@ async function handleRpc(rpc) {
           type: "object",
           properties: {
             text: { type: "string", description: "Draft instructions, maximum 4096 characters." },
-            line_id: { type: "string", description: "Target production line id (e.g. aboardable-product, chairfly-product). Required -- a draft is never sent to a default or guessed line." },
+            line_id: lineIdSchema,
           },
           required: ["text", "line_id"],
           additionalProperties: false,
@@ -523,9 +545,7 @@ async function handleRpc(rpc) {
         description: "Read the target production line's latest report. Read-only: cannot type into the worker, run project commands, or modify files.",
         inputSchema: {
           type: "object",
-          properties: {
-            line_id: { type: "string", description: "Target production line id (e.g. aboardable-product, chairfly-product). Required." },
-          },
+          properties: { line_id: lineIdSchema },
           required: ["line_id"],
           additionalProperties: false,
         },
@@ -534,9 +554,7 @@ async function handleRpc(rpc) {
         description: "Read a specific production line's worker status, terminal attachment state, pending-draft count, and latest report timestamp. Strictly read-only: cannot create, approve, send, delete, or modify drafts; cannot type into or control the worker.",
         inputSchema: {
           type: "object",
-          properties: {
-            line_id: { type: "string", description: "Target production line id (e.g. aboardable-product, chairfly-product). Required." },
-          },
+          properties: { line_id: lineIdSchema },
           required: ["line_id"],
           additionalProperties: false,
         },
