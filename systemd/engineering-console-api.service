@@ -1,0 +1,23 @@
+[Unit]
+Description=Engineering Console API (production lines, health, discovery)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=engineering-console
+Group=engineering-console
+Environment=HOME=/opt/engineering-console
+Environment=ABOARDABLE_CONTROLLER_ROOT=/var/lib/engineering-console
+Environment=ABOARDABLE_CONSOLE_PORT=8787
+ExecStart=/usr/bin/node /opt/engineering-console/bin/console-api.mjs
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/engineering-console
+
+[Install]
+WantedBy=multi-user.target

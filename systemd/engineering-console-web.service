@@ -1,0 +1,24 @@
+[Unit]
+Description=Engineering Console web UI (Approval Inbox, Production Lines, MCP)
+After=network.target
+
+[Service]
+Type=simple
+User=engineering-console
+Group=engineering-console
+ExecStart=/usr/bin/node /opt/engineering-console/bin/server.mjs
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aboardable-mcp-poc
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

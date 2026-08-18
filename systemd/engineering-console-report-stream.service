@@ -1,0 +1,21 @@
+[Unit]
+Description=Engineering Console worker report ingestion (Aboardable line; stays User=controller -- it's the only account with access to /home/controller/.claude/reports)
+After=network.target engineering-console-api.service
+
+[Service]
+Type=simple
+User=controller
+Group=controller
+Environment=HOME=/home/controller
+Environment=ABOARDABLE_CONTROLLER_ROOT=/var/lib/engineering-console
+ExecStart=/opt/engineering-console/bin/report-ingest-watch.sh
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/engineering-console
+
+[Install]
+WantedBy=multi-user.target
