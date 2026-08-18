@@ -156,6 +156,27 @@ SQL
     if [[ "$(sqlite3 "$DB" "SELECT count(*) FROM pragma_table_info('line_connections') WHERE name='tmux_version';")" == "0" ]]; then
         sqlite3 "$DB" "ALTER TABLE line_connections ADD COLUMN tmux_version TEXT;"
     fi
+    if [[ "$(sqlite3 "$DB" "SELECT count(*) FROM pragma_table_info('line_connections') WHERE name='dispatch_mode';")" == "0" ]]; then
+        sqlite3 "$DB" "ALTER TABLE line_connections ADD COLUMN dispatch_mode TEXT;"
+    fi
+    if [[ "$(sqlite3 "$DB" "SELECT count(*) FROM pragma_table_info('line_connections') WHERE name='dispatch_host';")" == "0" ]]; then
+        sqlite3 "$DB" "ALTER TABLE line_connections ADD COLUMN dispatch_host TEXT;"
+    fi
+    if [[ "$(sqlite3 "$DB" "SELECT count(*) FROM pragma_table_info('line_connections') WHERE name='dispatch_user';")" == "0" ]]; then
+        sqlite3 "$DB" "ALTER TABLE line_connections ADD COLUMN dispatch_user TEXT;"
+    fi
+    if [[ "$(sqlite3 "$DB" "SELECT count(*) FROM pragma_table_info('line_connections') WHERE name='dispatch_port';")" == "0" ]]; then
+        sqlite3 "$DB" "ALTER TABLE line_connections ADD COLUMN dispatch_port INTEGER;"
+    fi
+    if [[ "$(sqlite3 "$DB" "SELECT count(*) FROM pragma_table_info('line_connections') WHERE name='dispatch_key_path';")" == "0" ]]; then
+        sqlite3 "$DB" "ALTER TABLE line_connections ADD COLUMN dispatch_key_path TEXT;"
+    fi
+    if [[ "$(sqlite3 "$DB" "SELECT count(*) FROM pragma_table_info('line_connections') WHERE name='dispatch_report_key_path';")" == "0" ]]; then
+        sqlite3 "$DB" "ALTER TABLE line_connections ADD COLUMN dispatch_report_key_path TEXT;"
+    fi
+    if [[ "$(sqlite3 "$DB" "SELECT count(*) FROM pragma_table_info('line_connections') WHERE name='dispatch_tmux_session';")" == "0" ]]; then
+        sqlite3 "$DB" "ALTER TABLE line_connections ADD COLUMN dispatch_tmux_session TEXT;"
+    fi
     sqlite3 "$DB" "UPDATE reports SET line_id='aboardable-product' WHERE line_id IS NULL;"
     local reports_line_idx_exists
     reports_line_idx_exists="$(sqlite3 "$DB" "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='reports_line_idx';")"
@@ -187,6 +208,13 @@ seed_default_lines() {
     );"
     sqlite3 "$DB" "INSERT OR IGNORE INTO line_connections(line_id, ingestion_enabled, current_health_state)
         VALUES('aboardable-product', 1, 'unknown');"
+    sqlite3 "$DB" "UPDATE line_connections SET
+            dispatch_mode='ssh-relay',
+            dispatch_host='139.99.135.10',
+            dispatch_user='ubuntu',
+            dispatch_key_path='/var/lib/aboardable-mcp-poc/keys/worker_ed25519',
+            dispatch_report_key_path='/var/lib/aboardable-mcp-poc/keys/report_read_ed25519'
+        WHERE line_id='aboardable-product' AND dispatch_mode IS NULL;"
 }
 
 valid_run_id() {
@@ -480,7 +508,7 @@ lines_set_status() {
 lines_connections_set() {
     local line_id="$1" field="$2" value="$3"
     valid_line_id "$line_id" || return 64
-    [[ "$field" =~ '^(ingestion_enabled|current_health_state|last_connectivity_test_at|last_connectivity_result|claude_installed|claude_version|claude_checked_at|codex_installed|codex_version|codex_checked_at|tmux_session_name|tmux_last_seen_at|ssh_key_configured|ssh_key_fingerprint|ssh_key_configured_at)$' ]] || {
+    [[ "$field" =~ '^(ingestion_enabled|current_health_state|last_connectivity_test_at|last_connectivity_result|claude_installed|claude_version|claude_checked_at|codex_installed|codex_version|codex_checked_at|tmux_session_name|tmux_last_seen_at|ssh_key_configured|ssh_key_fingerprint|ssh_key_configured_at|dispatch_mode|dispatch_host|dispatch_user|dispatch_port|dispatch_key_path|dispatch_report_key_path|dispatch_tmux_session)$' ]] || {
         echo "unknown line_connections field: $field" >&2
         return 64
     }

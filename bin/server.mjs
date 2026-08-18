@@ -59,16 +59,48 @@ async function loadOAuthState() {
   }
 }
 
-function dispatchToWorker(payload) {
+// --- Per-line dispatch/status/report -----------------------------------
+// Every send, status check, and report read resolves through a specific
+// line's dispatch config (line_connections.dispatch_*) instead of one
+// hardcoded global worker. `aboardable-product` is seeded with
+// dispatch_mode='ssh-relay' and byte-identical host/key/known_hosts values
+// to what used to be hardcoded here, so its behavior is unchanged -- just
+// now data-driven. No mode ever falls back to another line's target; a
+// line with no/unknown dispatch_mode is a hard error, never a default.
+const SSH_RELAY_KNOWN_HOSTS = "/var/lib/aboardable-mcp-poc/keys/worker_known_hosts";
+
+function shq(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function sshTarget(line) {
+  return `${line.dispatch_user}@${line.dispatch_host}`;
+}
+
+function sshPortArgs(line) {
+  const port = Number(line.dispatch_port);
+  return port && port !== 22 ? ["-p", String(port)] : [];
+}
+
+function dispatchToWorker(payload, line) {
+  if (!line?.dispatch_mode) return Promise.reject(new Error(`Line "${line?.line_id || "(unknown)"}" has no dispatch configuration`));
+  if (line.dispatch_mode === "ssh-relay") return sshRelayDispatch(payload, line);
+  if (line.dispatch_mode === "tmux-ssh") return tmuxSshDispatch(payload, line);
+  return Promise.reject(new Error(`Unsupported dispatch mode "${line.dispatch_mode}" for line "${line.line_id}"`));
+}
+
+function sshRelayDispatch(payload, line) {
   return new Promise((resolve, reject) => {
+    if (!line.dispatch_key_path) return reject(new Error(`Line "${line.line_id}" has no dispatch_key_path configured for ssh-relay mode`));
     const child = spawn("/usr/bin/ssh", [
       "-T",
-      "-i", "/var/lib/aboardable-mcp-poc/keys/worker_ed25519",
+      "-i", line.dispatch_key_path,
       "-o", "IdentitiesOnly=yes",
-      "-o", "UserKnownHostsFile=/var/lib/aboardable-mcp-poc/keys/worker_known_hosts",
+      "-o", `UserKnownHostsFile=${SSH_RELAY_KNOWN_HOSTS}`,
       "-o", "BatchMode=yes",
       "-o", "ConnectTimeout=5",
-      "ubuntu@139.99.135.10",
+      ...sshPortArgs(line),
+      sshTarget(line),
     ], { stdio: ["pipe", "pipe", "pipe"] });
     let stderr = "";
     const timer = setTimeout(() => child.kill("SIGKILL"), 12_000);
@@ -87,16 +119,59 @@ function dispatchToWorker(payload) {
   });
 }
 
-function readWorkerReport() {
+// tmux set-buffer + paste-buffer (not `send-keys -l`) so arbitrary
+// multi-line/quoted payloads reach the pane safely -- the payload travels
+// over stdin ($(cat)) and never gets embedded in the remote command string.
+function tmuxSshDispatch(payload, line) {
   return new Promise((resolve, reject) => {
+    if (!line.dispatch_tmux_session) return reject(new Error(`Line "${line.line_id}" has no dispatch_tmux_session configured`));
+    const session = shq(line.dispatch_tmux_session);
+    const remoteCmd = `tmux set-buffer -b engineering-console -- "$(cat)" && tmux paste-buffer -b engineering-console -d -t ${session} && tmux send-keys -t ${session} Enter`;
     const child = spawn("/usr/bin/ssh", [
       "-T",
-      "-i", "/var/lib/aboardable-mcp-poc/keys/report_read_ed25519",
+      "-o", "BatchMode=yes",
+      "-o", "StrictHostKeyChecking=accept-new",
+      "-o", "ConnectTimeout=5",
+      ...sshPortArgs(line),
+      sshTarget(line),
+      remoteCmd,
+    ], { stdio: ["pipe", "pipe", "pipe"] });
+    let stderr = "";
+    const timer = setTimeout(() => child.kill("SIGKILL"), 12_000);
+    child.stderr.on("data", chunk => { stderr += chunk.toString(); });
+    child.on("error", reject);
+    child.on("close", code => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else {
+        const err = new Error(stderr.trim() || `tmux dispatch exited ${code}`);
+        err.exitCode = code;
+        reject(err);
+      }
+    });
+    child.stdin.end(payload);
+  });
+}
+
+function readWorkerReport(line) {
+  if (!line?.dispatch_mode) return Promise.reject(new Error(`Line "${line?.line_id || "(unknown)"}" has no dispatch configuration`));
+  if (line.dispatch_mode === "ssh-relay") return sshRelayReadReport(line);
+  if (line.dispatch_mode === "tmux-ssh") return tmuxSshReadReport(line);
+  return Promise.reject(new Error(`Unsupported dispatch mode "${line.dispatch_mode}" for line "${line.line_id}"`));
+}
+
+function sshRelayReadReport(line) {
+  return new Promise((resolve, reject) => {
+    if (!line.dispatch_report_key_path) return reject(new Error(`Line "${line.line_id}" has no dispatch_report_key_path configured`));
+    const child = spawn("/usr/bin/ssh", [
+      "-T",
+      "-i", line.dispatch_report_key_path,
       "-o", "IdentitiesOnly=yes",
-      "-o", "UserKnownHostsFile=/var/lib/aboardable-mcp-poc/keys/worker_known_hosts",
+      "-o", `UserKnownHostsFile=${SSH_RELAY_KNOWN_HOSTS}`,
       "-o", "BatchMode=yes",
       "-o", "ConnectTimeout=5",
-      "ubuntu@139.99.135.10",
+      ...sshPortArgs(line),
+      sshTarget(line),
     ], { stdio: ["ignore", "pipe", "pipe"] });
     const chunks = [];
     let size = 0;
@@ -117,53 +192,118 @@ function readWorkerReport() {
   });
 }
 
-async function getWorkerStatus() {
-  const observedAt = new Date().toISOString();
-  let worker = {
-    state: "unavailable",
-    process: null,
-    terminal_attached: false,
-    last_heartbeat_at: null,
-  };
+function tmuxSshReadReport(line) {
+  return new Promise((resolve, reject) => {
+    if (!line.report_source_path) return reject(new Error("No report available yet for this line."));
+    const remoteCmd = `cat ${shq(`${line.report_source_path}/latest.txt`)} 2>/dev/null`;
+    const child = spawn("/usr/bin/ssh", [
+      "-T",
+      "-o", "BatchMode=yes",
+      "-o", "StrictHostKeyChecking=accept-new",
+      "-o", "ConnectTimeout=6",
+      ...sshPortArgs(line),
+      sshTarget(line),
+      remoteCmd,
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    const chunks = [];
+    let size = 0;
+    const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+    child.stdout.on("data", chunk => {
+      size += chunk.length;
+      if (size <= 128 * 1024) chunks.push(chunk);
+      else child.kill("SIGKILL");
+    });
+    child.on("error", () => reject(new Error("No report available yet for this line.")));
+    child.on("close", code => {
+      clearTimeout(timer);
+      const text = Buffer.concat(chunks).toString("utf8");
+      if (code === 0 && text.trim()) resolve(text);
+      else reject(new Error("No report available yet for this line."));
+    });
+  });
+}
 
-  try {
-    const stored = JSON.parse(await readFile(WORKER_STATUS_FILE, "utf8"));
-    const heartbeatTime = new Date(stored.received_at).getTime();
-    const fresh = Number.isFinite(heartbeatTime) && Date.now() - heartbeatTime < 15_000;
-    worker.last_heartbeat_at = stored.received_at || null;
-    if (fresh) {
-      worker.state = /^(ready|working)$/.test(stored.state) ? stored.state : "unavailable";
-      worker.process = stored.process || null;
-      worker.terminal_attached = Boolean(stored.attached);
-    }
-  } catch {}
+function tmuxSessionExists(line) {
+  return new Promise((resolve) => {
+    if (!line.dispatch_tmux_session) return resolve(false);
+    const child = spawn("/usr/bin/ssh", [
+      "-T",
+      "-o", "BatchMode=yes",
+      "-o", "StrictHostKeyChecking=accept-new",
+      "-o", "ConnectTimeout=5",
+      ...sshPortArgs(line),
+      sshTarget(line),
+      `tmux has-session -t ${shq(line.dispatch_tmux_session)} 2>/dev/null`,
+    ], { stdio: ["ignore", "ignore", "ignore"] });
+    const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(false); }, 8_000);
+    child.on("error", () => { clearTimeout(timer); resolve(false); });
+    child.on("close", code => { clearTimeout(timer); resolve(code === 0); });
+  });
+}
 
-  let pendingDrafts = 0;
+async function countPendingDraftsForLine(lineId) {
+  let count = 0;
   for (const name of await readdir(STORE)) {
     if (!/^draft-[A-Za-z0-9-]+\.json$/.test(name)) continue;
     try {
       const record = JSON.parse(await readFile(path.join(STORE, name), "utf8"));
-      if (record.status === "PENDING_NOT_SENT" || record.status === "SEND_FAILED_RETRY_ALLOWED") pendingDrafts += 1;
+      if (record.line_id === lineId && (record.status === "PENDING_NOT_SENT" || record.status === "SEND_FAILED_RETRY_ALLOWED")) count += 1;
     } catch {}
   }
+  return count;
+}
 
-  let lastReportUpdatedAt = null;
-  let lastReportReceivedAt = null;
-  try {
-    const events = JSON.parse(await readFile(REPORT_EVENTS_PATH, "utf8"));
-    if (Array.isArray(events) && events[0]) {
-      lastReportUpdatedAt = events[0].updated_at || null;
-      lastReportReceivedAt = events[0].received_at || null;
+// Aboardable (ssh-relay) keeps the exact status mechanism it always had --
+// the same webhook-fed WORKER_STATUS_FILE and REPORT_EVENTS_PATH, only now
+// reached by line_id instead of implicitly. ChairFly (tmux-ssh) gets a
+// deliberately minimal, honest check -- does its tmux session exist -- not
+// a full heartbeat system it has no infrastructure for.
+async function getWorkerStatus(line) {
+  const observedAt = new Date().toISOString();
+  const pendingDrafts = await countPendingDraftsForLine(line.line_id);
+
+  if (line.dispatch_mode === "ssh-relay") {
+    let worker = { state: "unavailable", process: null, terminal_attached: false, last_heartbeat_at: null };
+    try {
+      const stored = JSON.parse(await readFile(WORKER_STATUS_FILE, "utf8"));
+      const heartbeatTime = new Date(stored.received_at).getTime();
+      const fresh = Number.isFinite(heartbeatTime) && Date.now() - heartbeatTime < 15_000;
+      worker.last_heartbeat_at = stored.received_at || null;
+      if (fresh) {
+        worker.state = /^(ready|working)$/.test(stored.state) ? stored.state : "unavailable";
+        worker.process = stored.process || null;
+        worker.terminal_attached = Boolean(stored.attached);
+      }
+    } catch {}
+
+    let lastReportUpdatedAt = null;
+    let lastReportReceivedAt = null;
+    try {
+      const events = JSON.parse(await readFile(REPORT_EVENTS_PATH, "utf8"));
+      if (Array.isArray(events) && events[0]) {
+        lastReportUpdatedAt = events[0].updated_at || null;
+        lastReportReceivedAt = events[0].received_at || null;
+      }
+    } catch {}
+
+    return { worker, pending_drafts: pendingDrafts, last_report_updated_at: lastReportUpdatedAt, last_report_received_at: lastReportReceivedAt, observed_at: observedAt };
+  }
+
+  if (line.dispatch_mode === "tmux-ssh") {
+    let worker = { state: "unavailable", process: null, terminal_attached: false, last_heartbeat_at: null };
+    if (await tmuxSessionExists(line)) {
+      worker = { state: "ready", process: line.dispatch_tmux_session, terminal_attached: true, last_heartbeat_at: observedAt };
     }
-  } catch {}
+    return {
+      worker,
+      pending_drafts: pendingDrafts,
+      last_report_updated_at: line.reports?.[0]?.detected_at || null,
+      last_report_received_at: null,
+      observed_at: observedAt,
+    };
+  }
 
-  return {
-    worker,
-    pending_drafts: pendingDrafts,
-    last_report_updated_at: lastReportUpdatedAt,
-    last_report_received_at: lastReportReceivedAt,
-    observed_at: observedAt,
-  };
+  return { worker: { state: "unavailable", process: null, terminal_attached: false, last_heartbeat_at: null }, pending_drafts: pendingDrafts, last_report_updated_at: null, last_report_received_at: null, observed_at: observedAt };
 }
 
 // --- Production Line Onboarding: compact status strip on the Approval Inbox
@@ -187,6 +327,23 @@ async function consoleApiFetch(pathname, options = {}) {
   });
   if (!response.ok) throw new Error(`console API ${pathname} returned ${response.status}`);
   return response.json();
+}
+
+// Every dispatch/status/report call resolves through this -- an unknown or
+// non-active line_id is a hard error, never a default or guessed target.
+async function resolveLine(lineId) {
+  if (typeof lineId !== "string" || !/^[a-z][a-z0-9-]{2,39}$/.test(lineId)) {
+    throw new Error("line_id is required and must be a valid production line identifier");
+  }
+  let line;
+  try {
+    line = await consoleApiFetch(`/v1/lines/${encodeURIComponent(lineId)}`);
+  } catch (err) {
+    throw new Error(`Could not resolve line_id "${lineId}": ${err.message}`);
+  }
+  if (!line || !line.line_id) throw new Error(`Unknown production line: ${lineId}`);
+  if (line.status !== "active") throw new Error(`Line "${lineId}" is not active (status: ${line.status})`);
+  return line;
 }
 
 const LINE_STATUS_COLOR = { active: "#2f8f4e", onboarding: "#a87a1f", paused: "#8a8a86", retired: "#8a8a86", archived: "#8a8a86" };
@@ -347,29 +504,36 @@ async function handleRpc(rpc) {
     return result(id, {
       tools: [{
         name: "create_worker_draft",
-        description: "POC only: save text as a pending draft. This NEVER executes or sends the text to a worker.",
+        description: "POC only: save text as a pending draft for a specific production line. This NEVER executes or sends the text to a worker.",
         inputSchema: {
           type: "object",
           properties: {
             text: { type: "string", description: "Draft instructions, maximum 4096 characters." },
+            line_id: { type: "string", description: "Target production line id (e.g. aboardable-product, chairfly-product). Required -- a draft is never sent to a default or guessed line." },
           },
-          required: ["text"],
+          required: ["text", "line_id"],
           additionalProperties: false,
         },
       }, {
         name: "read_worker_report",
-        description: "Read the active Product Claude Code worker's latest /home/ubuntu/.claude-report.md. Read-only: cannot type into the worker, run project commands, or modify files.",
+        description: "Read the target production line's latest report. Read-only: cannot type into the worker, run project commands, or modify files.",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: {
+            line_id: { type: "string", description: "Target production line id (e.g. aboardable-product, chairfly-product). Required." },
+          },
+          required: ["line_id"],
           additionalProperties: false,
         },
       }, {
         name: "get_worker_status",
-        description: "Read the Product worker's cached status, terminal attachment state, pending-draft count, and latest report timestamp. Strictly read-only: cannot create, approve, send, delete, or modify drafts; cannot type into or control the worker.",
+        description: "Read a specific production line's worker status, terminal attachment state, pending-draft count, and latest report timestamp. Strictly read-only: cannot create, approve, send, delete, or modify drafts; cannot type into or control the worker.",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: {
+            line_id: { type: "string", description: "Target production line id (e.g. aboardable-product, chairfly-product). Required." },
+          },
+          required: ["line_id"],
           additionalProperties: false,
         },
       }],
@@ -379,9 +543,11 @@ async function handleRpc(rpc) {
   if (method === "tools/call") {
     if (params?.name === "get_worker_status") {
       try {
-        const status = await getWorkerStatus();
+        const line = await resolveLine(params?.arguments?.line_id);
+        const status = await getWorkerStatus(line);
         const stateLabel = status.worker.state === "ready" ? "Ready" : status.worker.state === "working" ? "Working" : "Unavailable";
         const text = [
+          `Production line: ${line.display_name} (${line.line_id})`,
           `Product worker: ${stateLabel}`,
           `Process: ${status.worker.process || "none"}`,
           `Terminal attached: ${status.worker.terminal_attached ? "yes" : "no"}`,
@@ -391,7 +557,7 @@ async function handleRpc(rpc) {
         ].join("\n");
         return result(id, {
           content: [{ type: "text", text }],
-          structuredContent: status,
+          structuredContent: { ...status, line_id: line.line_id },
           isError: false,
         });
       } catch (err) {
@@ -403,11 +569,12 @@ async function handleRpc(rpc) {
     }
     if (params?.name === "read_worker_report") {
       try {
-        const report = await readWorkerReport();
+        const line = await resolveLine(params?.arguments?.line_id);
+        const report = await readWorkerReport(line);
         const sha256 = createHash("sha256").update(report).digest("hex");
         return result(id, {
           content: [{ type: "text", text: report }],
-          structuredContent: { source: "/home/ubuntu/.claude-report.md", bytes: Buffer.byteLength(report), sha256 },
+          structuredContent: { line_id: line.line_id, source: line.report_source_path ? `${line.report_source_path}/latest.txt` : "unknown", bytes: Buffer.byteLength(report), sha256 },
           isError: false,
         });
       } catch (err) {
@@ -424,11 +591,18 @@ async function handleRpc(rpc) {
     if (typeof text !== "string" || text.length < 1 || text.length > MAX_TEXT) {
       return error(id, -32602, `text must contain 1-${MAX_TEXT} characters`);
     }
+    let line;
+    try {
+      line = await resolveLine(params?.arguments?.line_id);
+    } catch (err) {
+      return error(id, -32602, String(err.message || err));
+    }
 
     const draftId = `draft-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}`;
     const sha256 = createHash("sha256").update(text).digest("hex");
     const record = {
       draft_id: draftId,
+      line_id: line.line_id,
       status: "PENDING_NOT_SENT",
       created_at: new Date().toISOString(),
       sha256,
@@ -440,9 +614,9 @@ async function handleRpc(rpc) {
     return result(id, {
       content: [{
         type: "text",
-        text: `Draft saved but NOT sent or executed. Draft ID: ${draftId}. SHA-256: ${sha256}. The owner must personally open this approval page and enter the private owner code: ${PUBLIC_ORIGIN}${APPROVE_BASE}/${draftId}?token=${record.approval_token}`,
+        text: `Draft saved but NOT sent or executed. Line: ${line.display_name} (${line.line_id}). Draft ID: ${draftId}. SHA-256: ${sha256}. The owner must personally open this approval page and enter the private owner code: ${PUBLIC_ORIGIN}${APPROVE_BASE}/${draftId}?token=${record.approval_token}`,
       }],
-      structuredContent: { draft_id: draftId, status: "PENDING_NOT_SENT", sha256 },
+      structuredContent: { draft_id: draftId, line_id: line.line_id, status: "PENDING_NOT_SENT", sha256 },
       isError: false,
     });
   }
@@ -596,19 +770,30 @@ const server = http.createServer(async (req, res) => {
         allRecords.push(record);
       } catch {}
     }
+    let lineNameById = new Map();
+    try {
+      const { lines } = await consoleApiFetch("/v1/lines");
+      for (const l of lines || []) lineNameById.set(l.line_id, l.display_name || l.line_id);
+    } catch {}
+    function lineLabelFor(record) {
+      return record.line_id
+        ? escapeHtml(lineNameById.get(record.line_id) || record.line_id)
+        : "No assigned line (predates per-line routing)";
+    }
     const records = allRecords.filter(record => record.status === "PENDING_NOT_SENT" || record.status === "SEND_FAILED_RETRY_ALLOWED");
     records.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
     let cards = records.map(record => {
       const subject = escapeHtml(draftSubject(record.text));
       const reference = escapeHtml(draftReference(record.draft_id));
+      const lineBadge = `<span class="draft-line-badge">${lineLabelFor(record)}</span>`;
       const preview = record.text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
       const shortPreview = String(record.text || "").slice(0, 220).trimEnd().replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
       const messageBody = String(record.text || "").length > 220
         ? `<details class="message-details"><summary><span class="message-preview">${shortPreview}…</span><span class="toggle-label"></span></summary><pre class="message-body">${preview}</pre></details>`
         : `<pre class="message-body">${preview}</pre>`;
-      return `<div class="draft-row" data-draft-id="${record.draft_id}"><form class="swipe-delete" method="post" data-draft-id="${record.draft_id}"><input type="hidden" name="token" value="${record.approval_token}"><button formaction="${INBOX_BASE}/discard/${record.draft_id}" class="discard delete-action">Delete</button></form><article class="draft-card" data-draft-id="${record.draft_id}" ontouchstart="this.dataset.swipeX=event.touches[0].clientX" ontouchmove="const d=Math.max(0,Math.min(96,event.touches[0].clientX-Number(this.dataset.swipeX||0)));this.dataset.swipeD=d;this.style.transform='translateX('+d+'px)'" ontouchend="this.style.transform=Number(this.dataset.swipeD||0)>48?'translateX(96px)':'translateX(0)' "><div class="draft-head"><div><h2>${subject}</h2><code class="draft-id" title="${record.draft_id}">${reference}</code><p><strong>${record.status}</strong> · ${record.created_at}</p></div><div class="draft-actions"><form class="desktop-delete" method="post" data-draft-id="${record.draft_id}"><input type="hidden" name="token" value="${record.approval_token}"><button formaction="${INBOX_BASE}/discard/${record.draft_id}" class="discard">Delete</button></form><form class="send-form" method="post" data-draft-id="${record.draft_id}"><input type="hidden" name="token" value="${record.approval_token}"><button formaction="${APPROVE_BASE}/${record.draft_id}" class="send">Send</button></form></div></div>${messageBody}<p class="swipe-hint">Swipe right to reveal Delete</p></article></div>`;
+      return `<div class="draft-row" data-draft-id="${record.draft_id}"><form class="swipe-delete" method="post" data-draft-id="${record.draft_id}"><input type="hidden" name="token" value="${record.approval_token}"><button formaction="${INBOX_BASE}/discard/${record.draft_id}" class="discard delete-action">Delete</button></form><article class="draft-card" data-draft-id="${record.draft_id}" ontouchstart="this.dataset.swipeX=event.touches[0].clientX" ontouchmove="const d=Math.max(0,Math.min(96,event.touches[0].clientX-Number(this.dataset.swipeX||0)));this.dataset.swipeD=d;this.style.transform='translateX('+d+'px)'" ontouchend="this.style.transform=Number(this.dataset.swipeD||0)>48?'translateX(96px)':'translateX(0)' "><div class="draft-head"><div><h2>${subject}</h2>${lineBadge}<code class="draft-id" title="${record.draft_id}">${reference}</code><p><strong>${record.status}</strong> · ${record.created_at}</p></div><div class="draft-actions"><form class="desktop-delete" method="post" data-draft-id="${record.draft_id}"><input type="hidden" name="token" value="${record.approval_token}"><button formaction="${INBOX_BASE}/discard/${record.draft_id}" class="discard">Delete</button></form><form class="send-form" method="post" data-draft-id="${record.draft_id}"><input type="hidden" name="token" value="${record.approval_token}"><button formaction="${APPROVE_BASE}/${record.draft_id}" class="send">Send</button></form></div></div>${messageBody}<p class="swipe-hint">Swipe right to reveal Delete</p></article></div>`;
     }).join("");
-    if (cards) cards = `<style>.draft-row{position:relative;overflow:hidden;margin:12px 0;border-radius:10px}.draft-card{position:relative;z-index:1;margin:0;transition:transform .18s ease;touch-action:pan-y;background:white}.draft-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.draft-head h2{margin:0 0 5px;font-size:16px;line-height:1.25;word-break:normal}.draft-id{display:block;margin:0 0 5px;color:#777;font-size:10px;line-height:1.25;word-break:break-all}.draft-head p{margin:0}.draft-actions{display:flex;align-items:flex-start;gap:6px;flex:0 0 auto}.send-form,.desktop-delete{margin:0}.send-form .send,.desktop-delete .discard{margin:0}.message-body,.message-preview{display:block;box-sizing:border-box;width:100%;font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;background:#e2e3e5;padding:13px;border-radius:7px;color:#171711}.message-body{margin:12px 0 0}.message-details{margin-top:12px}.message-details summary{list-style:none;cursor:pointer}.message-details summary::-webkit-details-marker{display:none}.toggle-label{display:inline-block;margin-top:7px;color:#555;text-decoration:underline;font-weight:650}.toggle-label:after{content:'See more'}.message-details[open] .message-preview{display:none}.message-details[open] .toggle-label:after{content:'See less'}.message-details[open] .message-body{margin-top:7px}.swipe-delete{display:none;position:absolute;inset:0 auto 0 0;width:96px;margin:0;background:#9b2c22}.delete-action{width:100%;height:100%;margin:0;border:0;border-radius:0;background:#9b2c22;color:white;font-weight:700}.swipe-hint{display:none;margin:8px 0 0;color:#777;font-size:11px}@media(hover:none),(pointer:coarse){.swipe-delete{display:flex}.desktop-delete{display:none}.swipe-hint{display:block}}</style>${cards}`;
+    if (cards) cards = `<style>.draft-row{position:relative;overflow:hidden;margin:12px 0;border-radius:10px}.draft-card{position:relative;z-index:1;margin:0;transition:transform .18s ease;touch-action:pan-y;background:white}.draft-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.draft-head h2{margin:0 0 5px;font-size:16px;line-height:1.25;word-break:normal}.draft-line-badge{display:inline-block;margin:0 0 5px;padding:2px 8px;border-radius:999px;background:#e5eef2;color:#245b78;font-size:11px;font-weight:650}.draft-id{display:block;margin:0 0 5px;color:#777;font-size:10px;line-height:1.25;word-break:break-all}.draft-head p{margin:0}.draft-actions{display:flex;align-items:flex-start;gap:6px;flex:0 0 auto}.send-form,.desktop-delete{margin:0}.send-form .send,.desktop-delete .discard{margin:0}.message-body,.message-preview{display:block;box-sizing:border-box;width:100%;font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;background:#e2e3e5;padding:13px;border-radius:7px;color:#171711}.message-body{margin:12px 0 0}.message-details{margin-top:12px}.message-details summary{list-style:none;cursor:pointer}.message-details summary::-webkit-details-marker{display:none}.toggle-label{display:inline-block;margin-top:7px;color:#555;text-decoration:underline;font-weight:650}.toggle-label:after{content:'See more'}.message-details[open] .message-preview{display:none}.message-details[open] .toggle-label:after{content:'See less'}.message-details[open] .message-body{margin-top:7px}.swipe-delete{display:none;position:absolute;inset:0 auto 0 0;width:96px;margin:0;background:#9b2c22}.delete-action{width:100%;height:100%;margin:0;border:0;border-radius:0;background:#9b2c22;color:white;font-weight:700}.swipe-hint{display:none;margin:8px 0 0;color:#777;font-size:11px}@media(hover:none),(pointer:coarse){.swipe-delete{display:flex}.desktop-delete{display:none}.swipe-hint{display:block}}</style>${cards}`;
     let reportEvents = [];
     try {
       reportEvents = JSON.parse(await readFile(REPORT_EVENTS_PATH, "utf8"));
@@ -621,13 +806,14 @@ const server = http.createServer(async (req, res) => {
       const recordId = escapeHtml(record.draft_id || "");
       const reference = escapeHtml(draftReference(record.draft_id));
       const subject = escapeHtml(draftSubject(record.text));
+      const lineLabel = lineLabelFor(record);
       if (record.status === "SENT_TO_PRODUCT_WORKER" && record.sent_at) {
         const sentAt = new Date(record.sent_at).toLocaleString("en-SG", { timeZone: "Asia/Singapore", day: "2-digit", month: "short", year: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true });
         const summary = String(record.text || "").replace(/\s+/g, " ").slice(0, 180).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-        activity.push({ at: record.sent_at, html: `<li class="sent-history"><strong>Sent</strong> · ${sentAt} SGT<br><code title="${recordId}">${reference}</code><p>${summary}${String(record.text || "").length > 180 ? "…" : ""}</p></li>` });
+        activity.push({ at: record.sent_at, html: `<li class="sent-history"><strong>Sent</strong> · ${sentAt} SGT · <span class="draft-line-badge">${lineLabel}</span><br><code title="${recordId}">${reference}</code><p>${summary}${String(record.text || "").length > 180 ? "…" : ""}</p></li>` });
       } else if ((record.status === "PENDING_NOT_SENT" || record.status === "SEND_FAILED_RETRY_ALLOWED") && record.created_at) {
         const createdAt = new Date(record.created_at).toLocaleString("en-SG", { timeZone: "Asia/Singapore", day: "2-digit", month: "short", year: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true });
-        activity.push({ at: record.created_at, html: `<li class="draft-created-history"><strong>Draft created</strong> · ${createdAt} SGT<br><code title="${recordId}">${reference}</code><p>${subject}</p></li>` });
+        activity.push({ at: record.created_at, html: `<li class="draft-created-history"><strong>Draft created</strong> · ${createdAt} SGT · <span class="draft-line-badge">${lineLabel}</span><br><code title="${recordId}">${reference}</code><p>${subject}</p></li>` });
       }
     }
     for (const event of reportEvents) {
@@ -654,7 +840,7 @@ const server = http.createServer(async (req, res) => {
     const topologyHtml = `<section style="background:#fff;border:1px solid #bbb;border-radius:10px;padding:13px;margin:10px 0 14px"><strong style="display:block;margin-bottom:10px">Live worker topology</strong>${healthNotice}<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><div><small>Controller inbox</small><br><strong><span style="color:#1f8a4c">●</span> Online</strong></div><span aria-hidden="true">→</span><div><small>Product worker</small><br><strong><span style="color:${stateColor}">●</span> ${stateLabel}</strong><br><small>${workerStatus.process || "No process"}${workerStatus.attached ? " · terminal attached" : ""} · ${checkedAt}</small></div></div><div class="latest-report-panel" data-report-id="${latestReportId}"><div class="report-history-head"><strong>Latest report</strong><span class="new-badge">New</span></div><pre style="margin:6px 0 0;background:transparent;padding:0">${latestReport}</pre></div></section>`;
     cards = topologyHtml + (cards || "<article><p>No pending drafts.</p></article>");
     cards = cards.replaceAll('<p class="swipe-hint">', '<div class="edit-bottom"><button type="button" class="edit-draft" data-edit-draft="1">Edit</button></div><p class="swipe-hint">');
-    return sendHtml(res, 200, `<!doctype html><meta name="viewport" content="width=device-width"><title>Engineering Control — Approval Inbox</title><style>body{font:14px system-ui;max-width:900px;margin:0 auto;padding:12px 18px 26px;color:#171711;background:#f7f7f4}header{display:flex;justify-content:space-between;align-items:center;gap:14px}header h1{margin:1px 0 6px;font-size:clamp(24px,5vw,34px)}.product-name{display:block;color:#687078;font-size:11px;font-weight:750;letter-spacing:.11em;text-transform:uppercase}.header-actions{display:flex;align-items:center;gap:10px}.header-actions form{margin:0}.link-button{border:0;background:none;padding:0;margin:0;text-decoration:underline;color:#171711}article{background:white;border:1px solid #aaa;border-radius:10px;padding:16px;margin:12px 0}h2{font-size:13px;word-break:break-all}pre{font-size:13px;line-height:1.4;white-space:pre-wrap;background:#f1f0eb;padding:13px;border-radius:7px}input,button{font:inherit;padding:9px 10px;margin:6px 7px 6px 0}button:disabled{opacity:.55}.send{background:#171711;color:white;border:0;border-radius:7px}.discard{background:white;color:#8a2f22;border:1px solid #8a2f22;border-radius:7px}a{color:#171711}.status{display:none;font-size:13px;padding:11px 13px;margin:10px 0;border-radius:8px;font-weight:650}.status.visible{display:block}.status.working{background:#fff2c7;color:#684b00}.status.success{background:#dff4e7;color:#174d2b}.status.error{background:#f7dfdc;color:#7b2118}.history{margin-top:20px}.history h2{font-size:18px}.history ul{list-style:none;padding:0}.history li{background:white;border:1px solid #ccc;border-radius:9px;padding:11px;margin:8px 0}.history li.sent-history{background:#e9e9e5;border-color:#d1d1cb;color:#686863}.history li.sent-history p{color:#777772}.history code{font-size:11px;word-break:break-all}.history p{font-size:13px;margin:6px 0 0;color:#555}.latest-report-panel{background:#e2e3e5;border:1px solid transparent;border-radius:7px;padding:10px;margin-top:11px;cursor:pointer}.report-history{cursor:pointer}.report-history-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.new-badge{display:none;background:#245b78;color:white;border-radius:999px;padding:2px 7px;font-size:10px;text-transform:uppercase;letter-spacing:.05em}.unread-report{background:#e8f1f6!important;border-color:#79a9c1!important;color:#173f54!important}.unread-report .new-badge{display:inline-block}.window-inactive::after{content:'Click once to activate';position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(242,242,242,.70);backdrop-filter:grayscale(1) blur(1px);color:#4b4b4b;font-size:16px;font-weight:700;pointer-events:none}.lines-strip{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;padding:6px 2px 8px;margin:2px 0 6px;border-bottom:1px solid #ddd}.line-dot{font:inherit;font-size:12px;background:none;border:0;padding:2px 0;color:#3d3d38;cursor:pointer}.line-dot span{font-size:11px}.lines-add{margin-left:auto;font-size:12px;color:#171711;text-decoration:underline;white-space:nowrap}.lines-strip-detail{flex-basis:100%;font-size:11px;color:#5c655c;padding-top:2px}.lines-strip-detail[hidden]{display:none}@media(max-width:560px){header{align-items:flex-start}.header-actions{flex-direction:column;align-items:flex-end;gap:4px}}</style><header><div><span class="product-name">Engineering Control</span><h1>Approval Inbox</h1></div><div class="header-actions"><a href="${INBOX_BASE}">Refresh</a><form method="post" action="${INBOX_BASE}/logout"><button class="link-button" type="submit">Log out</button></form></div></header>${await linesStripHtml()}<div id="status-banner" class="status" role="status" aria-live="polite"></div><p id="pending-summary">${records.length} pending draft${records.length === 1 ? "" : "s"}.</p><main id="draft-list">${cards || "<article><p>No pending drafts.</p></article>"}</main><section class="history"><h2>Recent activity</h2><ul id="recent-history">${recentHistory || "<li>No recent sends.</li>"}</ul></section><script>function syncWindowFocus(){document.body.classList.toggle("window-inactive",!document.hasFocus())}window.addEventListener("focus",syncWindowFocus);window.addEventListener("blur",syncWindowFocus);document.addEventListener("visibilitychange",syncWindowFocus);syncWindowFocus();const reportReadKey="ownerInboxLastReadReport";function storedReportId(){try{return localStorage.getItem(reportReadKey)||""}catch{return ""}}function saveReportId(id){try{localStorage.setItem(reportReadKey,id)}catch{}}function applyReportReadState(){const latest=document.querySelector(".latest-report-panel[data-report-id]");const latestId=latest?.dataset.reportId||"";let lastRead=storedReportId();if(!lastRead&&latestId){saveReportId(latestId);lastRead=latestId}let beforeLast=true;for(const item of document.querySelectorAll(".report-history[data-report-id]")){const id=item.dataset.reportId||"";if(id===lastRead)beforeLast=false;item.classList.toggle("unread-report",Boolean(id)&&beforeLast)}if(latest)latest.classList.toggle("unread-report",Boolean(latestId)&&latestId!==lastRead)}function markReportRead(item){const id=item?.dataset.reportId||"";if(id){saveReportId(id);applyReportReadState()}}document.addEventListener("click",event=>{const item=event.target.closest(".report-history,.latest-report-panel");if(item)markReportRead(item)});document.addEventListener("click",event=>{const dot=event.target.closest(".line-dot");const panel=document.getElementById("lines-strip-detail");if(!panel)return;if(!dot){panel.hidden=true;return}const expanded=dot.getAttribute("aria-expanded")==="true";document.querySelectorAll(".line-dot[aria-expanded=true]").forEach(other=>other.setAttribute("aria-expanded","false"));if(expanded){panel.hidden=true;return}dot.setAttribute("aria-expanded","true");panel.textContent=dot.dataset.lineDetail||"";panel.hidden=false});document.addEventListener("keydown",event=>{if(event.key!=="Enter"&&event.key!==" ")return;const item=event.target.closest(".report-history");if(item){event.preventDefault();markReportRead(item)}});applyReportReadState();function shortDraftReference(id){const compact=String(id||"").replace(/[^A-Za-z0-9]/g,"");return "Draft "+(compact.slice(-6).toUpperCase()||"------")}const inboxPath=${JSON.stringify(INBOX_BASE)};let submitting=false;const banner=document.getElementById("status-banner");function setBanner(message,type){banner.textContent=message;banner.className="status visible "+type}async function refreshInbox(){if(submitting)return;try{const response=await fetch(inboxPath,{cache:"no-store",credentials:"same-origin"});if(response.status===401){location.reload();return}if(!response.ok)return;const html=await response.text();const doc=new DOMParser().parseFromString(html,"text/html");const summary=doc.getElementById("pending-summary");const list=doc.getElementById("draft-list");const history=doc.getElementById("recent-history");const linesStrip=doc.getElementById("lines-strip");if(linesStrip)document.getElementById("lines-strip")?.replaceWith(linesStrip);if(summary&&list&&history){document.getElementById("pending-summary").innerHTML=summary.innerHTML;document.getElementById("draft-list").innerHTML=list.innerHTML;document.getElementById("recent-history").innerHTML=history.innerHTML;applyReportReadState()}}catch{}}document.addEventListener("submit",async event=>{const form=event.target.closest("form[data-draft-id]");if(!form)return;event.preventDefault();const button=event.submitter;if(!button||submitting)return;const draftId=form.dataset.draftId;const draftRef=shortDraftReference(draftId);const discarding=button.classList.contains("discard");submitting=true;document.querySelectorAll("button").forEach(item=>item.disabled=true);setBanner((discarding?"Discarding ":"Sending ")+draftRef+"…","working");try{const response=await fetch(button.formAction,{method:"POST",body:new URLSearchParams(new FormData(form)),credentials:"same-origin",redirect:"follow"});if(!response.ok){const html=await response.text();const doc=new DOMParser().parseFromString(html,"text/html");const heading=doc.querySelector("h1")?.textContent||"Action failed";const detail=doc.querySelector("p")?.textContent||"Nothing changed.";throw new Error(heading+": "+detail)}setBanner(draftRef+(discarding?" discarded.":" sent."),"success")}catch(error){setBanner(error.message,"error")}finally{submitting=false;document.querySelectorAll("button").forEach(item=>item.disabled=false);await refreshInbox()}});setInterval(refreshInbox,3000);</script>`);
+    return sendHtml(res, 200, `<!doctype html><meta name="viewport" content="width=device-width"><title>Engineering Control — Approval Inbox</title><style>body{font:14px system-ui;max-width:900px;margin:0 auto;padding:12px 18px 26px;color:#171711;background:#f7f7f4}header{display:flex;justify-content:space-between;align-items:center;gap:14px}header h1{margin:1px 0 6px;font-size:clamp(24px,5vw,34px)}.product-name{display:block;color:#687078;font-size:11px;font-weight:750;letter-spacing:.11em;text-transform:uppercase}.header-actions{display:flex;align-items:center;gap:10px}.header-actions form{margin:0}.link-button{border:0;background:none;padding:0;margin:0;text-decoration:underline;color:#171711}article{background:white;border:1px solid #aaa;border-radius:10px;padding:16px;margin:12px 0}h2{font-size:13px;word-break:break-all}pre{font-size:13px;line-height:1.4;white-space:pre-wrap;background:#f1f0eb;padding:13px;border-radius:7px}input,button{font:inherit;padding:9px 10px;margin:6px 7px 6px 0}button:disabled{opacity:.55}.send{background:#171711;color:white;border:0;border-radius:7px}.discard{background:white;color:#8a2f22;border:1px solid #8a2f22;border-radius:7px}a{color:#171711}.status{display:none;font-size:13px;padding:11px 13px;margin:10px 0;border-radius:8px;font-weight:650}.status.visible{display:block}.status.working{background:#fff2c7;color:#684b00}.status.success{background:#dff4e7;color:#174d2b}.status.error{background:#f7dfdc;color:#7b2118}.history{margin-top:20px}.history h2{font-size:18px}.history ul{list-style:none;padding:0}.history li{background:white;border:1px solid #ccc;border-radius:9px;padding:11px;margin:8px 0}.history li.sent-history{background:#e9e9e5;border-color:#d1d1cb;color:#686863}.draft-line-badge{display:inline-block;margin:0 0 5px;padding:2px 8px;border-radius:999px;background:#e5eef2;color:#245b78;font-size:11px;font-weight:650}.history li.sent-history p{color:#777772}.history code{font-size:11px;word-break:break-all}.history p{font-size:13px;margin:6px 0 0;color:#555}.latest-report-panel{background:#e2e3e5;border:1px solid transparent;border-radius:7px;padding:10px;margin-top:11px;cursor:pointer}.report-history{cursor:pointer}.report-history-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.new-badge{display:none;background:#245b78;color:white;border-radius:999px;padding:2px 7px;font-size:10px;text-transform:uppercase;letter-spacing:.05em}.unread-report{background:#e8f1f6!important;border-color:#79a9c1!important;color:#173f54!important}.unread-report .new-badge{display:inline-block}.window-inactive::after{content:'Click once to activate';position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(242,242,242,.70);backdrop-filter:grayscale(1) blur(1px);color:#4b4b4b;font-size:16px;font-weight:700;pointer-events:none}.lines-strip{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;padding:6px 2px 8px;margin:2px 0 6px;border-bottom:1px solid #ddd}.line-dot{font:inherit;font-size:12px;background:none;border:0;padding:2px 0;color:#3d3d38;cursor:pointer}.line-dot span{font-size:11px}.lines-add{margin-left:auto;font-size:12px;color:#171711;text-decoration:underline;white-space:nowrap}.lines-strip-detail{flex-basis:100%;font-size:11px;color:#5c655c;padding-top:2px}.lines-strip-detail[hidden]{display:none}@media(max-width:560px){header{align-items:flex-start}.header-actions{flex-direction:column;align-items:flex-end;gap:4px}}</style><header><div><span class="product-name">Engineering Control</span><h1>Approval Inbox</h1></div><div class="header-actions"><a href="${INBOX_BASE}">Refresh</a><form method="post" action="${INBOX_BASE}/logout"><button class="link-button" type="submit">Log out</button></form></div></header>${await linesStripHtml()}<div id="status-banner" class="status" role="status" aria-live="polite"></div><p id="pending-summary">${records.length} pending draft${records.length === 1 ? "" : "s"}.</p><main id="draft-list">${cards || "<article><p>No pending drafts.</p></article>"}</main><section class="history"><h2>Recent activity</h2><ul id="recent-history">${recentHistory || "<li>No recent sends.</li>"}</ul></section><script>function syncWindowFocus(){document.body.classList.toggle("window-inactive",!document.hasFocus())}window.addEventListener("focus",syncWindowFocus);window.addEventListener("blur",syncWindowFocus);document.addEventListener("visibilitychange",syncWindowFocus);syncWindowFocus();const reportReadKey="ownerInboxLastReadReport";function storedReportId(){try{return localStorage.getItem(reportReadKey)||""}catch{return ""}}function saveReportId(id){try{localStorage.setItem(reportReadKey,id)}catch{}}function applyReportReadState(){const latest=document.querySelector(".latest-report-panel[data-report-id]");const latestId=latest?.dataset.reportId||"";let lastRead=storedReportId();if(!lastRead&&latestId){saveReportId(latestId);lastRead=latestId}let beforeLast=true;for(const item of document.querySelectorAll(".report-history[data-report-id]")){const id=item.dataset.reportId||"";if(id===lastRead)beforeLast=false;item.classList.toggle("unread-report",Boolean(id)&&beforeLast)}if(latest)latest.classList.toggle("unread-report",Boolean(latestId)&&latestId!==lastRead)}function markReportRead(item){const id=item?.dataset.reportId||"";if(id){saveReportId(id);applyReportReadState()}}document.addEventListener("click",event=>{const item=event.target.closest(".report-history,.latest-report-panel");if(item)markReportRead(item)});document.addEventListener("click",event=>{const dot=event.target.closest(".line-dot");const panel=document.getElementById("lines-strip-detail");if(!panel)return;if(!dot){panel.hidden=true;return}const expanded=dot.getAttribute("aria-expanded")==="true";document.querySelectorAll(".line-dot[aria-expanded=true]").forEach(other=>other.setAttribute("aria-expanded","false"));if(expanded){panel.hidden=true;return}dot.setAttribute("aria-expanded","true");panel.textContent=dot.dataset.lineDetail||"";panel.hidden=false});document.addEventListener("keydown",event=>{if(event.key!=="Enter"&&event.key!==" ")return;const item=event.target.closest(".report-history");if(item){event.preventDefault();markReportRead(item)}});applyReportReadState();function shortDraftReference(id){const compact=String(id||"").replace(/[^A-Za-z0-9]/g,"");return "Draft "+(compact.slice(-6).toUpperCase()||"------")}const inboxPath=${JSON.stringify(INBOX_BASE)};let submitting=false;const banner=document.getElementById("status-banner");function setBanner(message,type){banner.textContent=message;banner.className="status visible "+type}async function refreshInbox(){if(submitting)return;try{const response=await fetch(inboxPath,{cache:"no-store",credentials:"same-origin"});if(response.status===401){location.reload();return}if(!response.ok)return;const html=await response.text();const doc=new DOMParser().parseFromString(html,"text/html");const summary=doc.getElementById("pending-summary");const list=doc.getElementById("draft-list");const history=doc.getElementById("recent-history");const linesStrip=doc.getElementById("lines-strip");if(linesStrip)document.getElementById("lines-strip")?.replaceWith(linesStrip);if(summary&&list&&history){document.getElementById("pending-summary").innerHTML=summary.innerHTML;document.getElementById("draft-list").innerHTML=list.innerHTML;document.getElementById("recent-history").innerHTML=history.innerHTML;applyReportReadState()}}catch{}}document.addEventListener("submit",async event=>{const form=event.target.closest("form[data-draft-id]");if(!form)return;event.preventDefault();const button=event.submitter;if(!button||submitting)return;const draftId=form.dataset.draftId;const draftRef=shortDraftReference(draftId);const discarding=button.classList.contains("discard");submitting=true;document.querySelectorAll("button").forEach(item=>item.disabled=true);setBanner((discarding?"Discarding ":"Sending ")+draftRef+"…","working");try{const response=await fetch(button.formAction,{method:"POST",body:new URLSearchParams(new FormData(form)),credentials:"same-origin",redirect:"follow"});if(!response.ok){const html=await response.text();const doc=new DOMParser().parseFromString(html,"text/html");const heading=doc.querySelector("h1")?.textContent||"Action failed";const detail=doc.querySelector("p")?.textContent||"Nothing changed.";throw new Error(heading+": "+detail)}setBanner(draftRef+(discarding?" discarded.":" sent."),"success")}catch(error){setBanner(error.message,"error")}finally{submitting=false;document.querySelectorAll("button").forEach(item=>item.disabled=false);await refreshInbox()}});setInterval(refreshInbox,3000);</script>`);
   }
 
   if (req.method === "POST" && url.pathname.startsWith(`${INBOX_BASE}/discard/`)) {
@@ -1067,7 +1253,14 @@ const server = http.createServer(async (req, res) => {
       const approvalToken = url.searchParams.get("token") || "";
       if (!safeEqual(approvalToken, record.approval_token)) return sendHtml(res, 403, "<h1>Invalid approval link</h1>");
       const preview = record.text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-      return sendHtml(res, 200, `<!doctype html><meta name="viewport" content="width=device-width"><title>Approve Product Worker Draft</title><style>body{font:17px system-ui;max-width:720px;margin:6vh auto;padding:24px;color:#171711}pre{white-space:pre-wrap;background:#f4f3ef;padding:18px;border:1px solid #aaa;border-radius:10px}input,button{font:inherit;padding:12px;margin-top:10px}input{width:min(320px,90%)}button{display:block;background:#171711;color:white;border:0;border-radius:8px}.warning{color:#8a2f22}</style><h1>Owner approval required</h1><p class="warning"><strong>Pressing Send will paste this instruction into the live Product Claude Code worker.</strong></p><p>Status: ${record.status}</p><pre>${preview}</pre><form method="post"><input type="hidden" name="token" value="${record.approval_token}"><label>Private 4-digit owner PIN<br><input name="owner_code" type="text" inputmode="numeric" pattern="[0-9]{4}" minlength="4" maxlength="4" required autocomplete="one-time-code" data-lpignore="true"></label><button type="submit">Send to Product Worker</button></form>`);
+      let lineLabelText = "No assigned line (predates per-line routing)";
+      if (record.line_id) {
+        try {
+          const previewLine = await consoleApiFetch(`/v1/lines/${encodeURIComponent(record.line_id)}`);
+          lineLabelText = previewLine?.display_name || record.line_id;
+        } catch { lineLabelText = record.line_id; }
+      }
+      return sendHtml(res, 200, `<!doctype html><meta name="viewport" content="width=device-width"><title>Approve Product Worker Draft</title><style>body{font:17px system-ui;max-width:720px;margin:6vh auto;padding:24px;color:#171711}pre{white-space:pre-wrap;background:#f4f3ef;padding:18px;border:1px solid #aaa;border-radius:10px}input,button{font:inherit;padding:12px;margin-top:10px}input{width:min(320px,90%)}button{display:block;background:#171711;color:white;border:0;border-radius:8px}.warning{color:#8a2f22}</style><h1>Owner approval required</h1><p class="warning"><strong>Pressing Send will paste this instruction into the live ${escapeHtml(lineLabelText)} worker.</strong></p><p>Status: ${record.status} · Line: ${escapeHtml(lineLabelText)}</p><pre>${preview}</pre><form method="post"><input type="hidden" name="token" value="${record.approval_token}"><label>Private 4-digit owner PIN<br><input name="owner_code" type="text" inputmode="numeric" pattern="[0-9]{4}" minlength="4" maxlength="4" required autocomplete="one-time-code" data-lpignore="true"></label><button type="submit">Send to Product Worker</button></form>`);
     }
 
     const form = new URLSearchParams(await readBody(req));
@@ -1084,7 +1277,22 @@ const server = http.createServer(async (req, res) => {
     if (record.status !== "PENDING_NOT_SENT" && record.status !== "SEND_FAILED_RETRY_ALLOWED") {
       return sendHtml(res, 409, `<h1>Not sent again</h1><p>This draft is already ${record.status}.</p>`);
     }
-    await appendFile(SEND_AUDIT_PATH, JSON.stringify({ at: new Date().toISOString(), draft_id: draftId, route: "owner-approval", remote: req.socket.remoteAddress || "", user_agent: String(req.headers["user-agent"] || "").slice(0, 240), via_inbox_session: hasOwnerInboxAuthorization(req, form) }) + "\n", { mode: 0o600 });
+    if (!record.line_id) {
+      return sendHtml(res, 409, "<h1>Cannot send</h1><p>This draft predates per-line routing and has no assigned production line. Discard it instead — it cannot be sent to a guessed target.</p>");
+    }
+    let line;
+    try {
+      line = await consoleApiFetch(`/v1/lines/${encodeURIComponent(record.line_id)}`);
+    } catch (err) {
+      return sendHtml(res, 502, `<h1>Cannot send</h1><p>Could not resolve production line "${escapeHtml(record.line_id)}": ${escapeHtml(String(err.message || err))}</p>`);
+    }
+    if (!line || !line.line_id) {
+      return sendHtml(res, 409, `<h1>Cannot send</h1><p>Production line "${escapeHtml(record.line_id)}" no longer exists.</p>`);
+    }
+    if (line.status !== "active") {
+      return sendHtml(res, 409, `<h1>Cannot send</h1><p>Production line "${escapeHtml(line.display_name || line.line_id)}" is not active (status: ${escapeHtml(line.status)}).</p>`);
+    }
+    await appendFile(SEND_AUDIT_PATH, JSON.stringify({ at: new Date().toISOString(), draft_id: draftId, line_id: line.line_id, route: "owner-approval", remote: req.socket.remoteAddress || "", user_agent: String(req.headers["user-agent"] || "").slice(0, 240), via_inbox_session: hasOwnerInboxAuthorization(req, form) }) + "\n", { mode: 0o600 });
 
     // Deliver only the owner-reviewed instruction. Claude Code treats formal
     // bridge metadata as an unfamiliar authority claim and correctly pauses;
@@ -1093,7 +1301,7 @@ const server = http.createServer(async (req, res) => {
     record.status = "SENDING";
     await writeFile(path.join(STORE, `${draftId}.json`), JSON.stringify(record, null, 2), { mode: 0o600 });
     try {
-      await dispatchToWorker(payload);
+      await dispatchToWorker(payload, line);
       record.status = "SENT_TO_PRODUCT_WORKER";
       record.sent_at = new Date().toISOString();
       await writeFile(path.join(STORE, `${draftId}.json`), JSON.stringify(record, null, 2), { mode: 0o600 });

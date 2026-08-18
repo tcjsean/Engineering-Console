@@ -180,7 +180,9 @@ function getLine(lineId) {
       c.codex_installed, c.codex_version, c.codex_checked_at, c.tmux_session_name,
       c.tmux_last_seen_at, c.tmux_installed, c.tmux_version, c.ingestion_enabled, c.last_ingested_at, c.last_run_id,
       c.ssh_key_configured, c.ssh_key_fingerprint, c.ssh_key_configured_at,
-      c.last_connectivity_test_at, c.last_connectivity_result, c.current_health_state
+      c.last_connectivity_test_at, c.last_connectivity_result, c.current_health_state,
+      c.dispatch_mode, c.dispatch_host, c.dispatch_user, c.dispatch_port,
+      c.dispatch_key_path, c.dispatch_report_key_path, c.dispatch_tmux_session
     FROM lines l LEFT JOIN line_connections c ON c.line_id = l.line_id
     WHERE l.line_id = ${sqlText(lineId)};`);
   if (!rows.length) return null;
@@ -256,6 +258,8 @@ function initialize() {
       ssh_key_configured INTEGER NOT NULL DEFAULT 0, ssh_key_fingerprint TEXT, ssh_key_configured_at TEXT,
       last_connectivity_test_at TEXT, last_connectivity_result TEXT,
       current_health_state TEXT NOT NULL DEFAULT 'unknown',
+      dispatch_mode TEXT, dispatch_host TEXT, dispatch_user TEXT, dispatch_port INTEGER,
+      dispatch_key_path TEXT, dispatch_report_key_path TEXT, dispatch_tmux_session TEXT,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS console_messages (
