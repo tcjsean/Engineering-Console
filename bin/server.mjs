@@ -30,6 +30,7 @@ const OAUTH_STATE_PATH = "/var/lib/aboardable-mcp-poc/credentials/oauth-state.js
 const REPORT_EVENTS_PATH = "/var/lib/aboardable-mcp-poc/credentials/report-events.json";
 const WORKER_STATUS_FILE = "/var/lib/aboardable-mcp-poc/credentials/worker-status.json";
 const SEND_AUDIT_PATH = "/var/lib/aboardable-mcp-poc/credentials/send-audit.jsonl";
+const MCP_CALL_AUDIT_PATH = "/var/lib/aboardable-mcp-poc/credentials/mcp-call-audit.log";
 const RESET_CONSUMED_PATH = "/var/lib/aboardable-mcp-poc/credentials/pin-reset-consumed";
 const RESET2_CONSUMED_PATH = "/var/lib/aboardable-mcp-poc/credentials/pin-reset2-consumed";
 const INBOX_COOKIE_VALUE = "85d46e8131eb463e9b6c439cf99a4768a5a1a713fa5a463e0b120bb5fd31248d";
@@ -1457,6 +1458,14 @@ const server = http.createServer(async (req, res) => {
   try {
     const body = JSON.parse(await readBody(req));
     const response = await handleRpc(body);
+    if (body?.method === "tools/call") {
+      const isErr = Boolean(response?.result?.isError);
+      appendFile(
+        MCP_CALL_AUDIT_PATH,
+        `${new Date().toISOString()} tool=${body?.params?.name || ""} line_id=${body?.params?.arguments?.line_id || ""} error=${isErr}\n`,
+        { mode: 0o600 },
+      ).catch(() => {});
+    }
     if (response === null) {
       res.writeHead(202, { "cache-control": "no-store" });
       res.end();
