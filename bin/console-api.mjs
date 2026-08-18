@@ -163,12 +163,26 @@ function configureLine(lineId, body = {}) {
   return { ok: true };
 }
 
+// Called after a successful read_worker_report tool call so the Approval
+// Inbox's "New" badge for this line clears for every viewer immediately,
+// not just in whichever single browser happens to click the panel. Not
+// tied to a specific report's run_id -- read_worker_report always fetches
+// whatever is currently live, so "now" is the correct read watermark:
+// anything detected at or before this moment has been seen.
+function markReportRead(lineId) {
+  if (!validLineId.test(lineId)) throw new Error("invalid line id");
+  sqlite(`INSERT OR IGNORE INTO line_connections(line_id) VALUES(${sqlText(lineId)});
+    UPDATE line_connections SET last_report_read_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE line_id=${sqlText(lineId)};`, false);
+  return { ok: true };
+}
+
 function listLines() {
   return sqlite(`
     SELECT l.line_id, l.display_name, l.product_name, l.line_type, l.phase, l.status,
            l.access_mode, l.agent_roles, l.claude_chat_visible, l.project_path,
            l.vps_hostname, l.updated_at,
-           c.ingestion_enabled, c.last_ingested_at, c.last_run_id, c.current_health_state
+           c.ingestion_enabled, c.last_ingested_at, c.last_run_id, c.current_health_state,
+           c.last_report_read_at
     FROM lines l LEFT JOIN line_connections c ON c.line_id = l.line_id
     ORDER BY (l.status != 'active'), l.display_name;
   `);
@@ -182,7 +196,8 @@ function getLine(lineId) {
       c.ssh_key_configured, c.ssh_key_fingerprint, c.ssh_key_configured_at,
       c.last_connectivity_test_at, c.last_connectivity_result, c.current_health_state,
       c.dispatch_mode, c.dispatch_host, c.dispatch_user, c.dispatch_port,
-      c.dispatch_key_path, c.dispatch_report_key_path, c.dispatch_tmux_session
+      c.dispatch_key_path, c.dispatch_report_key_path, c.dispatch_tmux_session,
+      c.last_report_read_at
     FROM lines l LEFT JOIN line_connections c ON c.line_id = l.line_id
     WHERE l.line_id = ${sqlText(lineId)};`);
   if (!rows.length) return null;
@@ -260,6 +275,7 @@ function initialize() {
       current_health_state TEXT NOT NULL DEFAULT 'unknown',
       dispatch_mode TEXT, dispatch_host TEXT, dispatch_user TEXT, dispatch_port INTEGER,
       dispatch_key_path TEXT, dispatch_report_key_path TEXT, dispatch_tmux_session TEXT,
+      last_report_read_at TEXT,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS console_messages (
@@ -686,12 +702,13 @@ createServer(async (request, response) => {
       return sendJson(response, 200, configureLine(lineConfigureMatch[1], await readJson(request)));
     }
 
-    const lineActionMatch = url.pathname.match(/^\/v1\/lines\/([a-z][a-z0-9-]{2,39})\/(test|pause|resume|retire|rollback|redetect)$/);
+    const lineActionMatch = url.pathname.match(/^\/v1\/lines\/([a-z][a-z0-9-]{2,39})\/(test|pause|resume|retire|rollback|redetect|mark-report-read)$/);
     if (request.method === "POST" && lineActionMatch) {
       const [, lineId, action] = lineActionMatch;
       if (action === "test") return sendJson(response, 200, runLineOnboard("verify", lineId));
       if (action === "rollback") return sendJson(response, 200, runLineOnboard("rollback", lineId));
       if (action === "redetect") return sendJson(response, 200, redetectLine(lineId));
+      if (action === "mark-report-read") return sendJson(response, 200, markReportRead(lineId));
       if (action === "pause") {
         spawnSync(join(controllerRoot, "controller-state.sh"), ["lines-set-status", lineId, "paused"], { encoding: "utf8" });
         spawnSync(join(controllerRoot, "controller-state.sh"), ["lines-connections-set", lineId, "ingestion_enabled", "0"], { encoding: "utf8" });

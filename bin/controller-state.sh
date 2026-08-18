@@ -177,6 +177,9 @@ SQL
     if [[ "$(sqlite3 "$DB" "SELECT count(*) FROM pragma_table_info('line_connections') WHERE name='dispatch_tmux_session';")" == "0" ]]; then
         sqlite3 "$DB" "ALTER TABLE line_connections ADD COLUMN dispatch_tmux_session TEXT;"
     fi
+    if [[ "$(sqlite3 "$DB" "SELECT count(*) FROM pragma_table_info('line_connections') WHERE name='last_report_read_at';")" == "0" ]]; then
+        sqlite3 "$DB" "ALTER TABLE line_connections ADD COLUMN last_report_read_at TEXT;"
+    fi
     sqlite3 "$DB" "UPDATE reports SET line_id='aboardable-product' WHERE line_id IS NULL;"
     local reports_line_idx_exists
     reports_line_idx_exists="$(sqlite3 "$DB" "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='reports_line_idx';")"
@@ -508,7 +511,7 @@ lines_set_status() {
 lines_connections_set() {
     local line_id="$1" field="$2" value="$3"
     valid_line_id "$line_id" || return 64
-    [[ "$field" =~ '^(ingestion_enabled|current_health_state|last_connectivity_test_at|last_connectivity_result|claude_installed|claude_version|claude_checked_at|codex_installed|codex_version|codex_checked_at|tmux_session_name|tmux_last_seen_at|ssh_key_configured|ssh_key_fingerprint|ssh_key_configured_at|dispatch_mode|dispatch_host|dispatch_user|dispatch_port|dispatch_key_path|dispatch_report_key_path|dispatch_tmux_session)$' ]] || {
+    [[ "$field" =~ '^(ingestion_enabled|current_health_state|last_connectivity_test_at|last_connectivity_result|claude_installed|claude_version|claude_checked_at|codex_installed|codex_version|codex_checked_at|tmux_session_name|tmux_last_seen_at|ssh_key_configured|ssh_key_fingerprint|ssh_key_configured_at|dispatch_mode|dispatch_host|dispatch_user|dispatch_port|dispatch_key_path|dispatch_report_key_path|dispatch_tmux_session|last_report_read_at)$' ]] || {
         echo "unknown line_connections field: $field" >&2
         return 64
     }
