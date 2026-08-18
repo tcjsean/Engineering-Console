@@ -332,8 +332,11 @@ async function consoleApiFetch(pathname, options = {}) {
 // Every dispatch/status/report call resolves through this -- an unknown or
 // non-active line_id is a hard error, never a default or guessed target.
 async function resolveLine(lineId) {
+  if (lineId === undefined || lineId === null || lineId === "") {
+    throw new Error("line_id is required (added when per-line routing shipped -- this is not an outage). If this MCP connector was already connected before that change, its cached tool list is stale: disconnect and reconnect the connector (or start a new session) to pick up the new required line_id parameter, then retry.");
+  }
   if (typeof lineId !== "string" || !/^[a-z][a-z0-9-]{2,39}$/.test(lineId)) {
-    throw new Error("line_id is required and must be a valid production line identifier");
+    throw new Error(`"${lineId}" is not a valid line_id`);
   }
   let line;
   try {
