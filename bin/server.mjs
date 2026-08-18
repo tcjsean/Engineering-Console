@@ -492,7 +492,7 @@ async function handleRpc(rpc) {
   if (method === "initialize") {
     return result(id, {
       protocolVersion: "2025-06-18",
-      capabilities: { tools: { listChanged: false } },
+      capabilities: { tools: { listChanged: true } },
       serverInfo: { name: "aboardable-draft-poc", version: "0.1.0" },
     });
   }
