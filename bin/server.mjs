@@ -776,7 +776,7 @@ const server = http.createServer(async (req, res) => {
       for (const l of lines || []) lineNameById.set(l.line_id, l.display_name || l.line_id);
     } catch {}
     function lineLabelFor(record) {
-      if (!record.line_id) return "No assigned line (predates per-line routing)";
+      if (!record.line_id) return "";
       const name = lineNameById.get(record.line_id) || record.line_id;
       return escapeHtml(name.replace(/\bProduct\b/gi, "").replace(/\s+/g, " ").trim());
     }
@@ -785,7 +785,8 @@ const server = http.createServer(async (req, res) => {
     let cards = records.map(record => {
       const subject = escapeHtml(draftSubject(record.text));
       const reference = escapeHtml(draftReference(record.draft_id));
-      const lineBadge = `<span class="draft-line-badge">${lineLabelFor(record)}</span>`;
+      const cardLineLabel = lineLabelFor(record);
+      const lineBadge = cardLineLabel ? `<span class="draft-line-badge">${cardLineLabel}</span>` : "";
       const preview = record.text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
       const shortPreview = String(record.text || "").slice(0, 220).trimEnd().replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
       const messageBody = String(record.text || "").length > 220
@@ -807,13 +808,14 @@ const server = http.createServer(async (req, res) => {
       const reference = escapeHtml(draftReference(record.draft_id));
       const subject = escapeHtml(draftSubject(record.text));
       const lineLabel = lineLabelFor(record);
+      const lineBadgeSuffix = lineLabel ? ` · <span class="draft-line-badge">${lineLabel}</span>` : "";
       if (record.status === "SENT_TO_PRODUCT_WORKER" && record.sent_at) {
         const sentAt = new Date(record.sent_at).toLocaleString("en-SG", { timeZone: "Asia/Singapore", day: "2-digit", month: "short", year: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true });
         const summary = String(record.text || "").replace(/\s+/g, " ").slice(0, 180).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-        activity.push({ at: record.sent_at, html: `<li class="sent-history"><strong>Sent</strong> · ${sentAt} SGT · <span class="draft-line-badge">${lineLabel}</span><br><code title="${recordId}">${reference}</code><p>${summary}${String(record.text || "").length > 180 ? "…" : ""}</p></li>` });
+        activity.push({ at: record.sent_at, html: `<li class="sent-history"><strong>Sent</strong> · ${sentAt} SGT${lineBadgeSuffix}<br><code title="${recordId}">${reference}</code><p>${summary}${String(record.text || "").length > 180 ? "…" : ""}</p></li>` });
       } else if ((record.status === "PENDING_NOT_SENT" || record.status === "SEND_FAILED_RETRY_ALLOWED") && record.created_at) {
         const createdAt = new Date(record.created_at).toLocaleString("en-SG", { timeZone: "Asia/Singapore", day: "2-digit", month: "short", year: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true });
-        activity.push({ at: record.created_at, html: `<li class="draft-created-history"><strong>Draft created</strong> · ${createdAt} SGT · <span class="draft-line-badge">${lineLabel}</span><br><code title="${recordId}">${reference}</code><p>${subject}</p></li>` });
+        activity.push({ at: record.created_at, html: `<li class="draft-created-history"><strong>Draft created</strong> · ${createdAt} SGT${lineBadgeSuffix}<br><code title="${recordId}">${reference}</code><p>${subject}</p></li>` });
       }
     }
     for (const event of reportEvents) {
