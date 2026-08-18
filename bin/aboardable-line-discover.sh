@@ -13,6 +13,14 @@ TIMEOUT_BIN="timeout"
 SCAN_TIMEOUT=8
 MAX_REPOS=12
 
+# A non-interactive SSH command (piped `bash -s`, no login/interactive
+# shell) doesn't source .bashrc/.profile, so user-local install locations
+# like ~/.local/bin (a common Claude Code/npm-global install path) are
+# invisible to plain `command -v` even when the tool is genuinely
+# installed. Extend PATH the same way an interactive shell would before
+# probing, rather than reporting a false "not installed".
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+
 hostname_val=$(hostname 2>/dev/null || echo "")
 whoami_val=$(whoami 2>/dev/null || echo "")
 
