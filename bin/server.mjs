@@ -385,10 +385,11 @@ function lineDotHtml(line) {
 async function linesStripHtml() {
   try {
     const { lines } = await consoleApiFetch("/v1/lines");
-    if (!Array.isArray(lines) || !lines.length) {
+    const activeLines = (lines || []).filter(l => l.status === "active");
+    if (!activeLines.length) {
       return `<div id="lines-strip" class="lines-strip"><a class="lines-add" href="${LINES_BASE}">+ Add line</a></div>`;
     }
-    const dots = lines.map(lineDotHtml).join("");
+    const dots = activeLines.map(lineDotHtml).join("");
     return `<div id="lines-strip" class="lines-strip">${dots}<a class="lines-add" href="${LINES_BASE}">+ Add line</a><div id="lines-strip-detail" class="lines-strip-detail" hidden></div></div>`;
   } catch {
     return "";
