@@ -1,3 +1,12 @@
 *.secret
 *.log
 node_modules/
+
+# service account home files
+.bash_logout
+.bashrc
+.profile
+.gitconfig
+.ssh/
+.codex/
+*.pre-branch-report-fix
