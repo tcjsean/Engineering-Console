@@ -759,9 +759,9 @@ const server = http.createServer(async (req, res) => {
       ssh_port: val("ssh_port", state.ssh_port || ""),
       project_path: val("project_path", repo?.path || state.manual_project_path || ""),
       worker_account,
-      report_source_path: val("report_source_path", state.vps_hostname ? "" : (worker_account ? `/home/${worker_account}/.claude/reports` : "")),
+      report_source_path: val("report_source_path", worker_account ? `/home/${worker_account}/.claude/reports` : ""),
       git_remote: val("git_remote", repo?.remote || ""),
-      default_branch: val("default_branch", repo?.default_branch || repo?.branch || ""),
+      default_branch: val("default_branch", repo?.branch || repo?.default_branch || ""),
     };
     for (const key of Object.keys(manifest)) { if (manifest[key] === "" || manifest[key] === undefined) delete manifest[key]; }
     return manifest;

@@ -70,12 +70,13 @@ run_checks() {
     fi
     emit_check "manifest_readable" "pass" "manifest is valid JSON"
 
-    local manifest_line_id project_path worker_account report_source_path vps_hostname git_remote default_branch line_type access_mode
+    local manifest_line_id project_path worker_account report_source_path vps_hostname ssh_user git_remote default_branch line_type access_mode
     manifest_line_id=$(jq -r '.line_id // empty' "$manifest_file")
     project_path=$(jq -r '.project_path // empty' "$manifest_file")
     worker_account=$(jq -r '.worker_account // empty' "$manifest_file")
     report_source_path=$(jq -r '.report_source_path // empty' "$manifest_file")
     vps_hostname=$(jq -r '.vps_hostname // empty' "$manifest_file")
+    ssh_user=$(jq -r '.ssh_user // empty' "$manifest_file")
     git_remote=$(jq -r '.git_remote // empty' "$manifest_file")
     default_branch=$(jq -r '.default_branch // empty' "$manifest_file")
     line_type=$(jq -r '.line_type // empty' "$manifest_file")
@@ -121,10 +122,12 @@ run_checks() {
     fi
 
     if [[ -n "$vps_hostname" ]]; then
-        if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$vps_hostname" true >/dev/null 2>&1; then
-            emit_check "ssh_reachable" "pass" "$vps_hostname reachable"
+        local ssh_target="$vps_hostname"
+        [[ -n "$ssh_user" ]] && ssh_target="$ssh_user@$vps_hostname"
+        if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$ssh_target" true >/dev/null 2>&1; then
+            emit_check "ssh_reachable" "pass" "$ssh_target reachable"
         else
-            emit_check "ssh_reachable" "warn" "$vps_hostname not reachable via SSH (non-fatal -- ingestion for remote lines is not yet automated in this milestone)"
+            emit_check "ssh_reachable" "warn" "$ssh_target not reachable via SSH (non-fatal -- ingestion for remote lines is not yet automated in this milestone)"
         fi
     fi
 
