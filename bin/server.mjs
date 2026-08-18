@@ -848,14 +848,14 @@ const server = http.createServer(async (req, res) => {
       const reference = escapeHtml(draftReference(record.draft_id));
       const subject = escapeHtml(draftSubject(record.text));
       const lineLabel = lineLabelFor(record);
-      const lineBadgeSuffix = lineLabel ? ` · <span class="draft-line-badge">${lineLabel}</span>` : "";
+      const lineBadgeHtml = lineLabel ? `<span class="draft-line-badge">${lineLabel}</span>` : "";
       if (record.status === "SENT_TO_PRODUCT_WORKER" && record.sent_at) {
         const sentAt = new Date(record.sent_at).toLocaleString("en-SG", { timeZone: "Asia/Singapore", day: "2-digit", month: "short", year: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true });
         const summary = String(record.text || "").replace(/\s+/g, " ").slice(0, 180).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-        activity.push({ at: record.sent_at, html: `<li class="sent-history"><strong>Sent</strong> · ${sentAt} SGT${lineBadgeSuffix}<br><code title="${recordId}">${reference}</code><p>${summary}${String(record.text || "").length > 180 ? "…" : ""}</p></li>` });
+        activity.push({ at: record.sent_at, html: `<li class="sent-history"><div class="report-history-head" style="margin-bottom:4px"><span><strong>Sent</strong> · ${sentAt} SGT</span>${lineBadgeHtml}</div><code title="${recordId}">${reference}</code><p>${summary}${String(record.text || "").length > 180 ? "…" : ""}</p></li>` });
       } else if ((record.status === "PENDING_NOT_SENT" || record.status === "SEND_FAILED_RETRY_ALLOWED") && record.created_at) {
         const createdAt = new Date(record.created_at).toLocaleString("en-SG", { timeZone: "Asia/Singapore", day: "2-digit", month: "short", year: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true });
-        activity.push({ at: record.created_at, html: `<li class="draft-created-history"><strong>Draft created</strong> · ${createdAt} SGT${lineBadgeSuffix}<br><code title="${recordId}">${reference}</code><p>${subject}</p></li>` });
+        activity.push({ at: record.created_at, html: `<li class="draft-created-history"><div class="report-history-head" style="margin-bottom:4px"><span><strong>Draft created</strong> · ${createdAt} SGT</span>${lineBadgeHtml}</div><code title="${recordId}">${reference}</code><p>${subject}</p></li>` });
       }
     }
     for (const event of reportEvents) {
